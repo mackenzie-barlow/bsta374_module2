@@ -1,0 +1,244 @@
+---
+title: "Cluster detection, live --- heart disease deaths in Michigan, 2000--2023"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: cosmo
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(leaflet)
+library(DT)
+library(tigris)
+library(SpatialEpi)                           
+options(tigris_use_cache = TRUE)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+
+mi_raw <- read_csv("COUNTandPOP2000to2023.csv",
+                   col_types = cols(County = col_character()))
+
+
+mi_map <- counties(state = "MI", cb = TRUE, year = 2020,
+                   progress_bar = FALSE) |>
+  st_transform(4326) |>                          # leaflet wants lon/lat
+  arrange(GEOID)
+
+
+county_ids <- mi_map |>
+  st_drop_geometry() |>
+  transmute(GEOID, county = NAME)
+
+mi <- mi_raw |>
+  filter(County != "Michigan") |>
+  pivot_longer(cols = `2000`:`2023`,
+               names_to = "year", values_to = "Y") |>
+  mutate(year = as.integer(year),
+         county = County) |>
+  select(county, year, Y, population = Population) |>
+  left_join(county_ids, by = "county") |>
+  select(GEOID, county, year, Y, population)
+
+
+if (anyNA(mi$GEOID)) {
+  stop("Some county names in the CSV did not match the Michigan county boundaries: ",
+       paste(unique(mi$county[is.na(mi$GEOID)]), collapse = ", "))
+}
+
+# County centroids
+cen <- st_geometry(mi_map) |> st_transform(5070) |> st_centroid()
+ll  <- st_coordinates(st_transform(cen, 4326))  
+km  <- st_coordinates(cen) / 1000                
+dist_km <- as.matrix(dist(km))                   
+# The scan, as in the SaTScan lecture
+run_scan <- function(d, max_window, reps) {
+  set.seed(374)
+  kd <- kulldorff(geo             = km,
+                  cases           = d$Y,
+                  population      = d$population,
+                  expected.cases  = d$E,         # Poisson model
+                  pop.upper.bound = max_window / 100,
+                  n.simulations   = reps,
+                  alpha.level     = 1,           # list every cluster
+                  plot            = FALSE)
+  cl <- c(list(kd$most.likely.cluster), kd$secondary.clusters)
+  cl <- Filter(function(x) x$log.likelihood.ratio > 0, cl)   # clusters with an excess
+  C  <- sum(d$Y)
+
+  clusters <- NULL                              
+  members  <- NULL                               
+  for (k in seq_along(cl)) {
+    x   <- cl[[k]]
+    ids <- x$location.IDs.included             
+    o   <- x$number.of.cases
+    e   <- x$expected.cases
+    dc  <- dist_km[ids[1], ]                    
+    clusters <- rbind(clusters, data.frame(
+      cluster   = k,
+      counties  = paste(sort(d$county[ids]), collapse = ", "),
+      n         = length(ids),
+      lon       = ll[ids[1], "X"],              
+      lat       = ll[ids[1], "Y"],
+      radius_km = round(max(dc[ids]), 1),        
+      circle_km = (max(dc[ids]) + min(dc[-ids])) / 2,  
+      observed  = o,
+      expected  = round(e),
+      O_E       = round(o / e, 2),              
+      RR        = round((o / e) / ((C - o) / (C - e)), 2), 
+      LLR       = round(x$log.likelihood.ratio, 1),
+      p         = x$p.value))
+    members <- rbind(members, data.frame(GEOID = d$GEOID[ids], cluster = k,
+                                         p = x$p.value))
+  }
+  list(clusters = clusters, members = members)
+}
+
+breaks <- c(0, 0.5, 2/3, 0.9, 1/0.9, 1.5, 2, Inf)   # Exercise 4 classes
+```
+
+Column {.sidebar data-width=260}
+-----------------------------------------------------------------------
+
+```{r inputs}
+sliderInput("years", "Years", min = 2000, max = 2023,
+            value = c(2000, 2023), step = 1, sep = "")
+sliderInput("max_window", "Maximum window (% of population)",
+            min = 5, max = 50, value = 50, step = 5, post = "%")
+radioButtons("reps", "Monte Carlo replications",
+             c("99", "999"), selected = "999", inline = TRUE)
+selectInput("alpha", "Map clusters with p below",
+            c("0.01", "0.05", "0.10"), selected = "0.05")
+```
+
+A purely spatial Poisson scan for high heart disease death rates, with
+`kulldorff()`. It reruns about a second after you change a setting.
+
+On the map, black outline: counties in a cluster with p below the cut-off;
+dashed circle: its scanning window.
+
+Expected cases: Michigan's rate in the selected years times each county's
+population exposure, as in Exercise 4. The CSV supplies one population value
+per county rather than annual populations, so that value is treated as a
+constant annual population and multiplied by the number of selected years
+(person-years) when calculating expected deaths.
+
+```{r reactive}
+years <- debounce(reactive(input$years), 1000)   # wait for the slider to stop
+
+# Deaths and population exposure by county, selected years
+by_county <- reactive({
+  req(years())
+  mi |>
+    filter(between(year, years()[1], years()[2])) |>
+    group_by(GEOID, county) |>
+    summarise(Y = sum(Y),
+              population = sum(population),
+              .groups = "drop") |>
+    mutate(E   = sum(Y) / sum(population) * population,   # expected
+           SIR = Y / E)
+})
+
+# The scan: reruns when a setting changes
+results <- reactive({
+  withProgress(message = "Running the scan...", {
+    run_scan(by_county(), input$max_window, as.integer(input$reps))
+  })
+})
+```
+
+Column {data-width=600}
+-----------------------------------------------------------------------
+
+### SIR and clusters, selected years
+
+```{r map}
+renderLeaflet({
+  alpha <- as.numeric(input$alpha)
+  sig   <- filter(results()$clusters, p < alpha) # clusters below the cut-off
+  d <- mi_map |>
+    left_join(by_county(), by = "GEOID") |>
+    left_join(results()$members, by = "GEOID")   # cluster and p, or NA
+  pal <- colorBin(rev(RColorBrewer::brewer.pal(7, "RdBu")),
+                  domain = d$SIR, bins = breaks)
+
+  m <- leaflet(d) |>
+    addProviderTiles("OpenStreetMap") |>
+    addPolygons(fillColor = ~pal(SIR), fillOpacity = 0.8,
+                color = "white", weight = 1,
+                label = ~sprintf("%s: SIR %.2f, cluster %s", NAME, SIR,
+                                 ifelse(is.na(cluster), "none", cluster))) |>
+    addLegend("bottomright", pal = pal, values = ~SIR,
+              title = paste0("SIR<br>", years()[1], "-", years()[2]),
+              labFormat = labelFormat(digits = 2), opacity = 0.8)
+
+  if (nrow(sig) > 0) {
+    m <- m |>
+      addPolygons(data = filter(d, p < alpha),   # counties in those clusters
+                  fill = FALSE, color = "black", weight = 1,
+                  group = "Cluster outlines") |>
+      addCircles(data = sig, lng = ~lon, lat = ~lat,
+                 radius = ~1000 * circle_km,     # km to metres
+                 fill = FALSE, color = "#333333", weight = 1.5,
+                 dashArray = "6 4", group = "Scanning circles") |>
+      addLabelOnlyMarkers(data = sig, lng = ~lon, lat = ~lat,
+                          label = ~as.character(cluster),
+                          labelOptions = labelOptions(noHide = TRUE,
+                                                      direction = "center"),
+                          group = "Scanning circles") |>
+      addLayersControl(overlayGroups = c("Cluster outlines", "Scanning circles"),
+                       options = layersControlOptions(collapsed = FALSE))  # checkboxes
+  }
+  m
+})
+```
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### Clusters below the cut-off
+
+```{r box-n}
+renderValueBox({
+  n <- sum(results()$clusters$p < as.numeric(input$alpha))
+  valueBox(n, caption = paste("clusters with p <", input$alpha),
+           icon = "fa-bullseye", color = if (n > 0) "primary" else "#5A6472")
+})
+```
+
+### Most likely cluster
+
+```{r box-mlc}
+renderValueBox({
+  clusters <- results()$clusters
+  if (is.null(clusters) || nrow(clusters) == 0) {
+    valueBox("None", icon = "fa-crosshairs",
+             caption = "no excess-risk cluster detected",
+             color = "#5A6472")
+  } else {
+    top <- clusters[1, ]                         # cluster 1
+    valueBox(sprintf("RR %.2f", top$RR), icon = "fa-crosshairs",
+             caption = sprintf("most likely cluster: %d counties, p = %s",
+                               top$n, top$p),
+             color = "#5A6472")
+  }
+})
+```
+
+### Clusters
+
+```{r table}
+renderDT({
+  results()$clusters |>
+    select(-lon, -lat, -circle_km) |>            # map-only columns off the table
+    datatable(rownames = FALSE, options = list(pageLength = 6, dom = "tp"))
+})
+```
